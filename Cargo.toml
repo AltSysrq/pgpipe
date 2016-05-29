@@ -1,0 +1,7 @@
+[package]
+name = "pgpipe"
+version = "0.1.0"
+authors = ["Jason Lingle <jason@lin.gl>"]
+
+[dependencies]
+gpgme = "0.4.0"
