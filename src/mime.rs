@@ -36,7 +36,9 @@
 //!   [RFC 2045]        Defines the Content-* headers
 //!   [RFC 2046]        Defines Multipart syntax
 
+use std::ascii::AsciiExt;
 use std::io::{BufRead,Result,Write};
+use std::iter::Peekable;
 use std::mem;
 use std::str;
 
@@ -427,6 +429,205 @@ impl<W : Write> LineWriter<W> {
             LineEnding::LF => self.dst.write_all("\n".as_bytes()),
             LineEnding::CRLF => self.dst.write_all("\r\n".as_bytes()),
         }
+    }
+}
+
+/// A deserialised representation of the Content-Type header. Only attributes
+/// PGPipe actually cares about are included.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct ContentType {
+    /// The top-level content type, eg, "multipart" or "text".
+    pub toplevel: Vec<u8>,
+    /// The content subtype, eg, "alternative" or "plain".
+    pub subtype: Vec<u8>,
+    /// If the Content-Type defines a "boundary" attribute, the value of that
+    /// boundary.
+    pub boundary: Option<Vec<u8>>,
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum ContentTypeChar {
+    Literal(u8),
+    Delimiter,
+    Slash, Semicolon, Equals,
+    Nil,
+}
+
+/// An iterator which lexes the Content-Type header, as per [RFC 2045], which
+/// of course us subtly different from the structured header syntax defined by
+/// [RFC 822].
+///
+/// This lexer is generally permissive. It permits arbitrary binary data, and
+/// ascribes no special meaning to the characters `<>@,[]?` which have no
+/// meaning in the Content-Type header. It also permits mixing quoted strings
+/// with tokens in the same word, or using multiple quoted strings in the same
+/// word. Unclosed quotes, unclosed or unbalanced comments, and trailing
+/// backslashes at the end of the string are silently ignored.
+///
+/// Handling of escaped CRLF-LWSP sequences is probably not correct, but they
+/// are not useful within the Content-Type header anyway.
+struct ContentTypeLexer<T : Iterator<Item = u8>> {
+    src: T,
+    comment_depth: u32,
+    in_quote: bool,
+    backslash: bool,
+}
+
+impl<T : Iterator<Item = u8>> Iterator for ContentTypeLexer<T> {
+    type Item = ContentTypeChar;
+
+    fn next(&mut self) -> Option<ContentTypeChar> {
+        use self::ContentTypeChar::*;
+
+        self.src.next().map(|ch| match ch {
+            // [RFC 822] permits backslash escapes to occur within comments and
+            // quoted-strings.
+            _ if self.backslash => {
+                self.backslash = false;
+                if self.comment_depth > 0 {
+                    // Backslash sequence in a comment suppresses any meaning
+                    // for the following character, but we still don't want to
+                    // emit it.
+                    Nil
+                } else {
+                    Literal(ch)
+                }
+            },
+            b'\\' => {
+                self.backslash = true;
+                Nil
+            },
+
+            // Quoted-strings also take effect in comments, yay
+            b'"' => {
+                self.in_quote = !self.in_quote;
+                Nil
+            },
+
+            // [RFC 822] states that backslash quoting is required for CR
+            // within a quoted-string, but doesn't really ascribe any meaning
+            // to it not being backslash-quoted. Since folding is ordinarily
+            // supposed to delete CR and LF, presumably that's the appropriate
+            // thing here.
+            b'\r' | b'\n' if self.in_quote => Nil,
+
+            _  if self.in_quote => {
+                if self.comment_depth > 0 {
+                    // Quoted-string prevents interpretation of the comment
+                    // characters, but we still don't want to emit the
+                    // characters themselves.
+                    Nil
+                } else {
+                    Literal(ch)
+                }
+            },
+
+            // Comments nest and count as delimiters
+            b'(' => {
+                self.comment_depth += 1;
+                Nil
+            },
+            b')' => {
+                if self.comment_depth > 0 {
+                    self.comment_depth -= 1;
+                }
+                Delimiter
+            },
+            _ if self.comment_depth > 0 => {
+                Nil
+            },
+
+            // [RFC 2045] only ascribes meaning to '/', '=', and ';' beyond the
+            // initial colon, besides the grammar common to all structured
+            // headers.
+            b'/' => Slash,
+            b'=' => Equals,
+            b';' => Semicolon,
+            // We need to include CR and LF here since the unfolder does not
+            // delete them.
+            b' ' | b'\t' | b'\r' | b'\n' => Delimiter,
+            // Anything else always stands for itself.
+            _ => Literal(ch),
+        })
+    }
+}
+
+impl<T : Iterator<Item = u8>> ContentTypeLexer<T> {
+    fn new(src: T) -> Self {
+        ContentTypeLexer {
+            src: src,
+            comment_depth: 0,
+            in_quote: false,
+            backslash: false,
+        }
+    }
+}
+
+/// Parses a Content-Type header.
+///
+/// This parser is _extremely_ permissive, and accepts many things most parsers
+/// wouldn't. If it successfully parses the Content-Type, at the very least it
+/// is guaranteed that there is a non-empty toplevel type and subtype.
+pub fn parse_content_type(data: &[u8]) -> Option<ContentType> {
+    use self::ContentTypeChar::*;
+    type CTC = ContentTypeChar;
+
+    let mut it = ContentTypeLexer::new(data.iter().cloned())
+        .filter(|ch| Nil != *ch)
+        .peekable();
+
+    fn skip_delims<T : Iterator<Item = CTC>>(it: &mut Peekable<T>) {
+        while Some(&Delimiter) == it.peek() {
+            it.next();
+        }
+    }
+
+    fn skip_to<T : Iterator<Item = CTC>>(it: &mut Peekable<T>, ch: CTC) {
+        while it.peek().map_or(false, |a| &ch != a) {
+            it.next();
+        }
+        it.next();
+    }
+
+    fn read_word<T : Iterator<Item = CTC>>(it: &mut Peekable<T>) -> Vec<u8> {
+        skip_delims(it);
+
+        let mut dst = Vec::new();
+        while let Some(&Literal(ch)) = it.peek() {
+            dst.push(ch);
+            it.next();
+        }
+        dst
+    }
+
+    let toplevel = read_word(&mut it);
+    skip_to(&mut it, Slash);
+    let subtype = read_word(&mut it);
+    skip_to(&mut it, Semicolon);
+
+    let mut boundary = None;
+
+    while it.peek().is_some() {
+        let attr = read_word(&mut it);
+        skip_to(&mut it, Equals);
+        let value = read_word(&mut it);
+        skip_to(&mut it, Semicolon);
+
+        if "boundary".as_bytes().eq_ignore_ascii_case(&attr) &&
+            !value.is_empty()
+        {
+            boundary = Some(value);
+        }
+    }
+
+    if !toplevel.is_empty() && !subtype.is_empty() {
+        Some(ContentType {
+            toplevel: toplevel,
+            subtype: subtype,
+            boundary: boundary,
+        })
+    } else {
+        None
     }
 }
 
@@ -832,5 +1033,118 @@ mod test {
         let line = generic_line(text);
 
         assert_eq!(None, line.split_header());
+    }
+
+    fn parse_ct(str: &str) -> ContentType {
+        parse_content_type(str.as_bytes()).expect("Failed to parse")
+    }
+
+    #[test]
+    fn parse_simple_content_type() {
+        let ct = parse_ct("text/plain");
+
+        assert_eq!("text".as_bytes(), &ct.toplevel[..]);
+        assert_eq!("plain".as_bytes(), &ct.subtype[..]);
+        assert!(ct.boundary.is_none());
+    }
+
+    #[test]
+    fn parse_simple_content_type_with_boundary() {
+        let ct = parse_ct("multipart/alternative; boundary=foo");
+
+        assert_eq!("multipart".as_bytes(), &ct.toplevel[..]);
+        assert_eq!("alternative".as_bytes(), &ct.subtype[..]);
+        assert_eq!("foo".as_bytes(), &ct.boundary.unwrap()[..]);
+    }
+
+    fn parse_with_boundary(expected_toplevel: &str,
+                           expected_subtype: &str,
+                           expected_boundary: &str,
+                           s: &str) {
+        let ct = parse_ct(s);
+        assert_eq!(expected_toplevel.as_bytes(), &ct.toplevel[..]);
+        assert_eq!(expected_subtype.as_bytes(), &ct.subtype[..]);
+        assert_eq!(expected_boundary.as_bytes(), &ct.boundary.unwrap()[..]);
+    }
+
+    #[test]
+    fn extraneous_space_supported_in_content_type() {
+        parse_with_boundary(
+            "a", "b", "foo", "a / b ; boundary = \t\r\nfoo");
+    }
+
+    #[test]
+    fn last_boundary_in_content_type_wins() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; bonudary=bar; boundary=foo");
+    }
+
+    #[test]
+    fn comments_in_content_type_ignored() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; boundary=foo; (boundary=bar)");
+    }
+
+    #[test]
+    fn content_type_quoting_supported() {
+        parse_with_boundary(
+            "a", "b", "foo:bar", "a/b; \"boundary\" = \"foo:bar\"");
+    }
+
+    #[test]
+    fn content_type_escapes_in_quotes_supported() {
+        parse_with_boundary(
+            "a", "b", "\"\\", "a/b; boundary=\"\\\"\\\\\"");
+    }
+
+    #[test]
+    fn content_type_escapes_and_quotes_in_comments_supported() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; (\"(\\\"(\"\\() boundary=foo");
+    }
+
+    #[test]
+    fn content_type_unclosed_comment_ignored() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; boundary=foo (");
+    }
+
+    #[test]
+    fn content_type_unbalanced_close_paren_ignored() {
+        parse_with_boundary(
+            "a", "b", "foo", "a)/b);boundary=foo)");
+    }
+
+    #[test]
+    fn content_type_unclosed_quote_tolerated() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; boundary=\"foo");
+    }
+
+    #[test]
+    fn content_type_bs_at_end_ignored() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; boundary=foo\\");
+    }
+
+    #[test]
+    fn content_type_other_things_ignored() {
+        parse_with_boundary(
+            "a", "b", "foo", "a/b; boundary=foo; plugh=xyzzy; ;/=?[]@");
+    }
+
+    #[test]
+    fn content_type_rejected_if_no_slash() {
+        assert!(parse_content_type("text plain".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn content_type_rejected_if_subtype_empty() {
+        assert!(parse_content_type("text/".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn content_type_rejected_if_toplevel_type_empty() {
+        assert!(parse_content_type("/foo".as_bytes()).is_none());
     }
 }
