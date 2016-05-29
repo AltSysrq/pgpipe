@@ -38,6 +38,7 @@
 
 use std::io::{BufRead,Result,Write};
 use std::mem;
+use std::str;
 
 /// The maximum line size before we split the line into smaller parts. (The
 /// fact that there is no line ending between them is preserved).
@@ -129,6 +130,57 @@ impl<'a> Line<'a> {
     pub fn is_blank(&self) -> bool {
         LineClass::Generic == self.class &&
             self.text.is_empty()
+    }
+
+    /// Attempts to interpret this line as a MIME header, splitting it into its
+    /// name and value parts.
+    ///
+    /// If the header is sufficiently valid, returns a pair slices into the
+    /// line which reference the name (as a string) and the value of the
+    /// header. Leading whitespace in the value is not removed. Also note that
+    /// the header unfolder keeps newline sequences in the logical lines, so
+    /// the header value may contain line feeds.
+    ///
+    /// While the header name is constrained to printable ASCII, this function
+    /// permits arbitrary binary data in the value.
+    pub fn split_header(&self) -> Option<(&str,&[u8])> {
+        // MIME's weird quoting/commenting rules do not take place before the
+        // colon ending the header name.
+        //
+        // [RFC 822, section 3.1.2]
+        //
+        // > The  field-name must be composed of printable ASCII characters
+        // > (i.e., characters that  have  values  between  33.  and  126.,
+        // > decimal, except colon).  The field-body may be composed of any
+        // > ASCII characters, except CR or LF.
+        //
+        // (Though note that our header unfolder preserves CR and LF in the
+        // field-body.)
+
+        let mut colon = 0;
+        // Search for the colon ending the field-name. This is not a valid
+        // header if we do not find one, or find a non-printable ASCII
+        // character.
+        loop {
+            if colon >= self.text.len() {
+                return None;
+            }
+            if b':' == self.text[colon] {
+                break;
+            }
+            if self.text[colon] < 33 || self.text[colon] > 126 {
+                return None;
+            }
+            colon += 1;
+        }
+
+        // field-name is invalid if empty
+        if 0 == colon {
+            return None;
+        }
+
+        return str::from_utf8(&self.text[0..colon]).ok().map(
+            |name| (name, &self.text[colon + 1 ..]));
     }
 }
 
@@ -737,5 +789,48 @@ mod test {
         assert_eq!(None, reader.read_header(&mut accum).unwrap());
         assert_eq!(LineClass::Generic, reader.curr().class);
         assert_eq!("\tMore Text".as_bytes(), reader.curr().text);
+    }
+
+    fn generic_line(s: &str) -> Line {
+        Line {
+            class: LineClass::Generic,
+            ending: LineEnding::Nil,
+            text: s.as_bytes(),
+        }
+    }
+
+    #[test]
+    fn split_header_well_formed() {
+        let text = "Foo: Bär";
+        let line = generic_line(text);
+
+        let (name, value) = line.split_header()
+            .expect("Failed to split header");
+        assert_eq!("Foo", name);
+        assert_eq!(" Bär".as_bytes(), value);
+    }
+
+    #[test]
+    fn split_header_colon_at_beginning() {
+        let text = ":foo: bar";
+        let line = generic_line(text);
+
+        assert_eq!(None, line.split_header());
+    }
+
+    #[test]
+    fn split_header_space_in_name() {
+        let text = "foo bar: baz";
+        let line = generic_line(text);
+
+        assert_eq!(None, line.split_header());
+    }
+
+    #[test]
+    fn split_header_del_in_name() {
+        let text = "foo\x7fbar: baz";
+        let line = generic_line(text);
+
+        assert_eq!(None, line.split_header());
     }
 }
