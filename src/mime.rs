@@ -90,6 +90,48 @@ pub struct Line<'a> {
     pub ending: LineEnding,
 }
 
+/// Describes the result of trying to extract multiple lines as a header.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum Headerness {
+    /// The line(s) look like a complete header, as far as folding is
+    /// concerned.
+    Header,
+    /// The line(s) are not a complete header. This could be due to the
+    /// unfolded length exceeding the maximum line length, or due to a folded
+    /// line appearing spuriously.
+    RawLine,
+}
+
+/// Returns whether the given character is a "linear whitespace" character
+/// according to RFC 822.
+fn is_lwsp(ch: u8) -> bool {
+    b' ' == ch || b'\t' == ch
+}
+
+impl<'a> Line<'a> {
+    /// Returns whether the given line is the first line of a header (assuming
+    /// it is in a header block).
+    pub fn is_start_of_header(&self) -> bool {
+        LineClass::Generic == self.class &&
+            !self.text.is_empty() &&
+            !is_lwsp(self.text[0])
+    }
+
+    /// Returns whether the given line is a header continuation (assuming it is
+    /// in a header block).
+    pub fn is_header_continuation(&self) -> bool {
+        LineClass::Generic == self.class &&
+            !self.text.is_empty() &&
+            is_lwsp(self.text[0])
+    }
+
+    /// Returns whether this line is a generic blank line.
+    pub fn is_blank(&self) -> bool {
+        LineClass::Generic == self.class &&
+            self.text.is_empty()
+    }
+}
+
 /// Reads physical lines from a MIME file.
 pub struct LineReader<R : BufRead> {
     src: R,
@@ -151,6 +193,59 @@ impl<R : BufRead> LineReader<R> {
     pub fn set_multipart_delim(&mut self, delim: Option<Vec<u8>>)
                                -> Option<Vec<u8>> {
         mem::replace(&mut self.multipart_delim, delim)
+    }
+
+    /// Reads a logical header line, assuming the current line is in a header
+    /// block.
+    ///
+    /// If the current line is not the start of a header, returns None and
+    /// consumes nothing. Otherwise, accumulates the header into `accum`,
+    /// returning a line representing the combined text. If the header spans
+    /// multiple lines, interior line endings are included, but the terminating
+    /// line ending is not.
+    ///
+    /// A header will be terminated prematurely if any constituent physical
+    /// lines were truncated, or if the combined length exceeds the maximum
+    /// line length.
+    ///
+    /// In all cases where a line is returned, all constituent lines whose
+    /// contents were added to `accum` will have been consumed.
+    pub fn read_header<'a>(&mut self, accum: &'a mut Vec<u8>)
+                           -> Result<Option<(Headerness, Line<'a>)>> {
+        if !self.curr().is_start_of_header() {
+            return Ok(None)
+        }
+
+        accum.clear();
+        let mut last_ending = LineEnding::Nil;
+        let mut headerness = Headerness::RawLine;
+        loop {
+            accum.extend_from_slice(match last_ending {
+                LineEnding::Nil => "".as_bytes(),
+                LineEnding::LF => "\n".as_bytes(),
+                LineEnding::CRLF => "\r\n".as_bytes(),
+            });
+            accum.extend_from_slice(self.curr().text);
+            last_ending = self.curr().ending;
+            try!(self.read_next());
+
+            if LineClass::Truncated == self.curr().class {
+                break;
+            }
+            if !self.curr().is_header_continuation() {
+                headerness = Headerness::Header;
+                break;
+            }
+            if accum.len() > MAX_LINE {
+                break;
+            }
+        }
+
+        Ok(Some((headerness, Line {
+            class: LineClass::Generic,
+            ending: last_ending,
+            text: accum,
+        })))
     }
 
     fn empty(src: R) -> Self {
@@ -491,5 +586,156 @@ mod test {
         reader.read_next().unwrap();
 
         assert_eq!(LineClass::Eof, reader.curr().class);
+    }
+
+    #[test]
+    fn read_simple_header() {
+        let file = "From: jason@lin.gl\r\nSubject: Test\n\n";
+        let mut reader = reader_test(&file);
+        let mut accum = Vec::new();
+
+        {
+            let (h,line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(LineClass::Generic, line.class);
+            assert_eq!(LineEnding::CRLF, line.ending);
+            assert_eq!("From: jason@lin.gl".as_bytes(), line.text);
+        }
+
+        {
+            let (h,line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(LineClass::Generic, line.class);
+            assert_eq!(LineEnding::LF, line.ending);
+            assert_eq!("Subject: Test".as_bytes(), line.text);
+        }
+
+        assert_eq!(None, reader.read_header(&mut accum).unwrap());
+        assert!(reader.curr().is_blank());
+
+        reader.read_next().unwrap();
+        assert_eq!(LineClass::Eof, reader.curr().class);
+    }
+
+    #[test]
+    fn read_folded_header() {
+        let file = "From mbox\n\
+                    Subject: Foo\r\n\
+                    \tBar\n\
+                    To: nobody\n\
+                    \x20 (plugh)\r\n\
+                    X: Y\n\
+                    From mbox\n\
+                    Subject: Xyzzy\n\
+                    \n\
+                    \tOther text\n";
+        let mut reader = reader_test(&file);
+        let mut accum = Vec::new();
+
+        assert_eq!(None, reader.read_header(&mut accum).unwrap());
+        assert_eq!(LineClass::MessageStart, reader.curr().class);
+        reader.read_next().unwrap();
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(LineClass::Generic, line.class);
+            assert_eq!(LineEnding::LF, line.ending);
+            assert_eq!("Subject: Foo\r\n\tBar".as_bytes(), line.text);
+        }
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(LineClass::Generic, line.class);
+            assert_eq!(LineEnding::CRLF, line.ending);
+            assert_eq!("To: nobody\n  (plugh)".as_bytes(), line.text);
+        }
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(LineClass::Generic, line.class);
+            assert_eq!(LineEnding::LF, line.ending);
+            assert_eq!("X: Y".as_bytes(), line.text);
+        }
+
+        assert_eq!(None, reader.read_header(&mut accum).unwrap());
+        assert_eq!(LineClass::MessageStart, reader.curr().class);
+        reader.read_next().unwrap();
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(LineClass::Generic, line.class);
+            assert_eq!(LineEnding::LF, line.ending);
+            assert_eq!("Subject: Xyzzy".as_bytes(), line.text);
+        }
+
+        assert_eq!(None, reader.read_header(&mut accum).unwrap());
+        assert!(reader.curr().is_blank());
+    }
+
+    #[test]
+    fn folded_headers_may_exceed_line_limit_by_one_line() {
+        let mut six_hundred = String::with_capacity(600);
+        for _ in 0..600 {
+            six_hundred.push('x');
+        }
+        let mut file = String::with_capacity(1220);
+        file.push_str(&six_hundred);
+        file.push_str("\n\t");
+        file.push_str(&six_hundred);
+        file.push_str("\nFoo: Bar\n");
+
+        let mut reader = reader_test(&file);
+        let mut accum = Vec::new();
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!(1202, line.text.len());
+        }
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::Header, h);
+            assert_eq!("Foo: Bar".as_bytes(), line.text);
+        }
+    }
+
+    #[test]
+    fn folded_headers_truncated_if_over_max_length() {
+        let mut six_hundred = String::with_capacity(600);
+        for _ in 0..600 {
+            six_hundred.push('x');
+        }
+        let mut file = String::with_capacity(1220);
+        file.push_str(&six_hundred);
+        file.push_str("\n\t");
+        file.push_str(&six_hundred);
+        file.push_str("\n\tMore Text\n");
+
+        let mut reader = reader_test(&file);
+        let mut accum = Vec::new();
+
+        {
+            let (h, line) = reader.read_header(&mut accum).unwrap()
+                .expect("No header found");
+            assert_eq!(Headerness::RawLine, h);
+            assert_eq!(1202, line.text.len());
+        }
+
+        assert_eq!(None, reader.read_header(&mut accum).unwrap());
+        assert_eq!(LineClass::Generic, reader.curr().class);
+        assert_eq!("\tMore Text".as_bytes(), reader.curr().text);
     }
 }
