@@ -136,18 +136,8 @@ impl<'a> Line<'a> {
             self.text.is_empty()
     }
 
-    /// Attempts to interpret this line as a MIME header, splitting it into its
-    /// name and value parts.
-    ///
-    /// If the header is sufficiently valid, returns a pair slices into the
-    /// line which reference the name (as a string) and the value of the
-    /// header. Leading whitespace in the value is not removed. Also note that
-    /// the header unfolder keeps newline sequences in the logical lines, so
-    /// the header value may contain line feeds.
-    ///
-    /// While the header name is constrained to printable ASCII, this function
-    /// permits arbitrary binary data in the value.
-    pub fn split_header(&self) -> Option<(&str,&[u8])> {
+    /// Like `split_header`, but operates on a plain slice.
+    pub fn split_header_slice(text: &[u8]) -> Option<(&str,&[u8])> {
         // MIME's weird quoting/commenting rules do not take place before the
         // colon ending the header name.
         //
@@ -166,13 +156,13 @@ impl<'a> Line<'a> {
         // header if we do not find one, or find a non-printable ASCII
         // character.
         loop {
-            if colon >= self.text.len() {
+            if colon >= text.len() {
                 return None;
             }
-            if b':' == self.text[colon] {
+            if b':' == text[colon] {
                 break;
             }
-            if self.text[colon] < 33 || self.text[colon] > 126 {
+            if text[colon] < 33 || text[colon] > 126 {
                 return None;
             }
             colon += 1;
@@ -183,8 +173,23 @@ impl<'a> Line<'a> {
             return None;
         }
 
-        return str::from_utf8(&self.text[0..colon]).ok().map(
-            |name| (name, &self.text[colon + 1 ..]));
+        return str::from_utf8(&text[0..colon]).ok().map(
+            |name| (name, &text[colon + 1 ..]));
+    }
+
+    /// Attempts to interpret this line as a MIME header, splitting it into its
+    /// name and value parts.
+    ///
+    /// If the header is sufficiently valid, returns a pair slices into the
+    /// line which reference the name (as a string) and the value of the
+    /// header. Leading whitespace in the value is not removed. Also note that
+    /// the header unfolder keeps newline sequences in the logical lines, so
+    /// the header value may contain line feeds.
+    ///
+    /// While the header name is constrained to printable ASCII, this function
+    /// permits arbitrary binary data in the value.
+    pub fn split_header(&self) -> Option<(&str,&[u8])> {
+        Line::split_header_slice(self.text)
     }
 }
 
@@ -411,7 +416,11 @@ impl<R : BufRead> LineReader<R> {
 /// the information it needs is carried in the text content and the line
 /// ending.
 pub struct LineWriter<W : Write> {
-    dst: W,
+    /// The underlying binary writer.
+    ///
+    /// The `LineWriter` does not do any buffering itself, so it is reasonable
+    /// to access this directly when emitting raw bytes is necessary.
+    pub dst: W,
 }
 
 impl<W : Write> LineWriter<W> {
@@ -445,6 +454,23 @@ pub struct ContentType {
     /// If the Content-Type defines a "boundary" attribute, the value of that
     /// boundary.
     pub boundary: Option<Vec<u8>>,
+}
+
+impl ContentType {
+    /// Returns whether this `ContentType` has a top-level type matching `tl`.
+    pub fn is_toplevel_type(&self, tl: &str) -> bool {
+        tl.as_bytes().eq_ignore_ascii_case(&self.toplevel)
+    }
+
+    /// Returns whether this `ContentType` has a subtype matching `st`.
+    ///
+    /// The actual subtype may be an X- prefix to `st`.
+    pub fn is_subtype(&self, st: &str) -> bool {
+        (st.as_bytes().eq_ignore_ascii_case(&self.subtype) ||
+         (self.subtype.len() > 2 &&
+          "x-".as_bytes().eq_ignore_ascii_case(&self.subtype[0..2]) &&
+          st.as_bytes().eq_ignore_ascii_case(&self.subtype[2..])))
+    }
 }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -1297,6 +1323,24 @@ mod test {
     #[test]
     fn content_type_rejected_if_toplevel_type_empty() {
         assert!(parse_content_type("/foo".as_bytes()).is_none());
+    }
+
+    #[test]
+    fn content_type_simple_type_tests() {
+        let ct = parse_ct("TeXt/PlAiN");
+        assert!(ct.is_toplevel_type("text"));
+        assert!(!ct.is_toplevel_type("tex"));
+        assert!(!ct.is_toplevel_type("texts"));
+        assert!(ct.is_subtype("plain"));
+        assert!(!ct.is_subtype("plai"));
+        assert!(!ct.is_subtype("plains"));
+    }
+
+    #[test]
+    fn content_type_x_prefix_permitted_on_subtype() {
+        let ct = parse_ct("FoO/X-PlUgh");
+        assert!(ct.is_subtype("x-plugh"));
+        assert!(ct.is_subtype("plugh"));
     }
 
     fn copy_entity_stream<T : io::BufRead>(rd: &mut EntityStream<T>)

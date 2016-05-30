@@ -16,6 +16,7 @@
 extern crate gpgme;
 
 mod mime;
+mod pipe;
 
 fn main() {
     println!("hello world");
