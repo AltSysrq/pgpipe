@@ -27,6 +27,8 @@
 use std::ascii::AsciiExt;
 use std::io::{BufRead,Read,Result,Write};
 
+use uuid::Uuid;
+
 use mime;
 
 /// Maximum depth of multipart nesting before we simply copy the whole
@@ -76,6 +78,17 @@ pub trait SeparatorGen {
     /// to splice into a quoted-string without escaping, and must not exceeed
     /// 70 characters in length.
     fn gen(&mut self) -> Vec<u8>;
+}
+
+/// Separator generator based on random UUIDs.
+///
+/// This is the standard `SeparatorGen` implementation for non-testing use.
+#[derive(Clone,Copy,Debug)]
+pub struct UuidSeparatorGen;
+impl SeparatorGen for UuidSeparatorGen {
+    fn gen(&mut self) -> Vec<u8> {
+        format!("PGPipe-{}", Uuid::new_v4()).as_bytes().to_vec()
+    }
 }
 
 struct Pipe<'a, R : BufRead + 'a, W : Write + 'a,

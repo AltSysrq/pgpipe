@@ -14,6 +14,7 @@
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 extern crate gpgme;
+extern crate uuid;
 
 mod mime;
 mod pipe;
