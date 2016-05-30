@@ -37,7 +37,8 @@
 //!   [RFC 2046]        Defines Multipart syntax
 
 use std::ascii::AsciiExt;
-use std::io::{BufRead,Result,Write};
+use std::cmp::min;
+use std::io::{BufRead,Read,Result,Write};
 use std::iter::Peekable;
 use std::mem;
 use std::str;
@@ -45,6 +46,7 @@ use std::str;
 /// The maximum line size before we split the line into smaller parts. (The
 /// fact that there is no line ending between them is preserved).
 const MAX_LINE : usize = 1024;
+static CRLF : [u8;2] = [b'\r', b'\n'];
 
 /// Identifies the type of a line.
 ///
@@ -631,8 +633,157 @@ pub fn parse_content_type(data: &[u8]) -> Option<ContentType> {
     }
 }
 
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum EntityStreamState {
+    LineBody,
+    LineEnding,
+    Eof
+}
+
+/// Provides access as a byte stream to an entity / body part in a MIME
+/// message.
+///
+/// The stream runs from the current line of the `LineReader` at the time the
+/// stream is constructed up to but not including the first encountered line
+/// whose class is greater than `Generic`. Whether the line ending preceding
+/// that point is dependent on context. The terminating line is not consumed.
+pub struct EntityStream<'a, T : BufRead + 'a> {
+    src: &'a mut LineReader<T>,
+    // The stream is implemented as a state machine, switching alternately
+    // between yielding bytes from the line proper and the line ending.
+    //
+    // We start off in the `LineBody` state. When `line_off` passes the end of
+    // the line body, the state switches to `LineEnding`. When the LineEdning
+    // state is entered, we consume the current line from `src` and move onto
+    // the next. `line_off` is reset to 0, and `ending_buf` set to the full
+    // ending for the current line. Line ending switches back to `LineBody`
+    // when its buffer becomes empty.
+    //
+    // Both state transitions can instead go to `Eof`; this happens for
+    // `LineBody` if the terminating line is one which includes its _own_
+    // newline as a prefix. `LineEnding` simply switches to `Eof` if the next
+    // line is a terminator.
+    //
+    // Both the `LineBody` and `LineEnding` states may produce empty buffers;
+    // thus, sometimes multiple state transitions are needed in sequence in
+    // order to not have a premature EOF.
+    state: EntityStreamState,
+    line_off: usize,
+    ending_buf: &'static [u8],
+    // Track the previous line ending, so we can report it if we don't consume
+    // it.
+    prev_ending: LineEnding,
+}
+
+impl<'a, T : BufRead + 'a> EntityStream<'a, T> {
+    pub fn new(src: &'a mut LineReader<T>) -> Self {
+        let ending = src.curr().ending;
+        let mut this = EntityStream {
+            src: src,
+            state: EntityStreamState::LineBody,
+            line_off: 0,
+            ending_buf: &CRLF,
+            prev_ending: ending,
+        };
+        this.next_line();
+        this
+    }
+
+    fn next_line(&mut self) {
+        self.line_off = 0;
+        self.ending_buf = match self.src.curr().ending {
+            LineEnding::Nil => &CRLF[2..2],
+            LineEnding::LF => &CRLF[1..2],
+            LineEnding::CRLF => &CRLF[0..2],
+        };
+    }
+
+    fn curr_buf(&self) -> &[u8] {
+        match self.state {
+            EntityStreamState::LineBody =>
+                &self.src.curr().text[self.line_off..],
+            EntityStreamState::LineEnding => self.ending_buf,
+            EntityStreamState::Eof => &CRLF[0..0],
+        }
+    }
+
+    fn need_next_buf(&self) -> bool {
+        EntityStreamState::Eof != self.state && self.curr_buf().is_empty()
+    }
+
+    fn next_buf(&mut self) -> Result<()> {
+        match self.state {
+            EntityStreamState::LineBody => {
+                self.prev_ending = self.src.curr().ending;
+                try!(self.src.read_next());
+                self.state = if self.unconsumed_line_ending().is_some() {
+                    EntityStreamState::Eof
+                } else {
+                    EntityStreamState::LineEnding
+                };
+            },
+            EntityStreamState::LineEnding => {
+                self.next_line();
+                self.state = if self.src.curr().class <= LineClass::Generic {
+                    EntityStreamState::LineBody
+                } else {
+                    EntityStreamState::Eof
+                };
+            },
+            EntityStreamState::Eof => panic!("Called next_buf() in EOF state"),
+        }
+        Ok(())
+    }
+
+    /// Returns the line ending that the stream did not consume, if any.
+    pub fn unconsumed_line_ending(&self) -> Option<LineEnding> {
+        match self.src.curr().class {
+            // Multiparts and mbox messages include an extra newline
+            // after the body they enclose.
+            LineClass::MessageStart | LineClass::MultipartDelim |
+            LineClass::MultipartEnd => Some(self.prev_ending),
+            LineClass::Eof if self.src.mbox => Some(self.prev_ending),
+            _ => None,
+        }
+    }
+}
+
+impl<'a, T : BufRead + 'a> Read for EntityStream<'a, T> {
+    fn read(&mut self, dst: &mut [u8]) -> Result<usize> {
+        let len = {
+            let src = try!(self.fill_buf());
+            let len = min(dst.len(), src.len());
+            dst[0..len].clone_from_slice(&src[0..len]);
+            len
+        };
+        self.consume(len);
+        Ok(len)
+    }
+}
+
+impl<'a, T : BufRead + 'a> BufRead for EntityStream<'a, T> {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        while self.need_next_buf() {
+            try!(self.next_buf());
+        }
+        Ok(self.curr_buf())
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self.state {
+            EntityStreamState::LineBody =>
+                self.line_off += amt,
+            EntityStreamState::LineEnding =>
+                self.ending_buf = &self.ending_buf[amt..],
+            EntityStreamState::Eof => assert_eq!(0, amt),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::io;
+
     use super::*;
     use super::MAX_LINE;
 
@@ -1146,5 +1297,103 @@ mod test {
     #[test]
     fn content_type_rejected_if_toplevel_type_empty() {
         assert!(parse_content_type("/foo".as_bytes()).is_none());
+    }
+
+    fn copy_entity_stream<T : io::BufRead>(rd: &mut EntityStream<T>)
+                                           -> Vec<u8> {
+        let mut out = Vec::new();
+        io::copy(rd, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn entity_stream_to_eof() {
+        let file = "foo\r\n\
+                    bar\n\
+                    baz";
+        let mut reader = reader_test(file);
+        {
+            let mut entity = EntityStream::new(&mut reader);
+            let copied = copy_entity_stream(&mut entity);
+
+            assert_eq!(file.as_bytes(), &copied[..]);
+            assert_eq!(None, entity.unconsumed_line_ending());
+        }
+        assert_eq!(LineClass::Eof, reader.curr().class);
+    }
+
+    #[test]
+    fn entity_stream_to_multipart_no_nl() {
+        let file = "foo\r\n\
+                    bar\r\n\
+                    --DELIM--";
+        let mut reader = reader_test(file);
+        reader.set_multipart_delim(
+            Some("DELIM".as_bytes().iter().cloned().collect()));
+        {
+            let mut entity = EntityStream::new(&mut reader);
+            let copied = copy_entity_stream(&mut entity);
+
+            assert_eq!("foo\r\nbar".as_bytes(), &copied[..]);
+            assert_eq!(Some(LineEnding::CRLF),
+                       entity.unconsumed_line_ending());
+        }
+        assert_eq!(LineClass::MultipartEnd, reader.curr().class);
+    }
+
+    #[test]
+    fn entity_stream_to_multipart_with_nl() {
+        let file = "foo\r\n\
+                    bar\r\n\
+                    \n\
+                    --DELIM--";
+        let mut reader = reader_test(file);
+        reader.set_multipart_delim(
+            Some("DELIM".as_bytes().iter().cloned().collect()));
+        {
+            let mut entity = EntityStream::new(&mut reader);
+            let copied = copy_entity_stream(&mut entity);
+
+            assert_eq!("foo\r\nbar\r\n".as_bytes(), &copied[..]);
+            assert_eq!(Some(LineEnding::LF),
+                       entity.unconsumed_line_ending());
+        }
+        assert_eq!(LineClass::MultipartEnd, reader.curr().class);
+    }
+
+    #[test]
+    fn entity_stream_to_eof_mbox() {
+        let file = "From foo\n\
+                    foo\n";
+        let mut reader = reader_test(file);
+        reader.read_next().unwrap();
+        {
+            let mut entity = EntityStream::new(&mut reader);
+            let copied = copy_entity_stream(&mut entity);
+
+            assert_eq!("foo".as_bytes(), &copied[..]);
+            assert_eq!(Some(LineEnding::LF),
+                       entity.unconsumed_line_ending());
+        }
+        assert_eq!(LineClass::Eof, reader.curr().class);
+    }
+
+    #[test]
+    fn entity_stream_to_next_message_mbox() {
+        let file = "From foo\n\
+                    foo\n\
+                    From bar\n\
+                    bar\n";
+        let mut reader = reader_test(file);
+        reader.read_next().unwrap();
+        {
+            let mut entity = EntityStream::new(&mut reader);
+            let copied = copy_entity_stream(&mut entity);
+
+            assert_eq!("foo".as_bytes(), &copied[..]);
+            assert_eq!(Some(LineEnding::LF),
+                       entity.unconsumed_line_ending());
+        }
+        assert_eq!(LineClass::MessageStart, reader.curr().class);
     }
 }
