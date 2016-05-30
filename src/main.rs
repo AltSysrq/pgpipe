@@ -18,6 +18,7 @@ extern crate uuid;
 
 mod mime;
 mod pipe;
+mod crypt;
 
 fn main() {
     println!("hello world");

@@ -65,8 +65,8 @@ const SIGNED : &'static str = "signed";
 /// Abstracts away the process of encrypting a stream bytes.
 pub trait Encrypt {
     /// Encrypts the entirety of the `src` stream into `dst`.
-    fn encrypt<R : Read + ?Sized, W : Write + ?Sized>(
-        &self, src: &mut R, dst: &mut W) -> Result<()>;
+    fn encrypt<R : Read + Send, W : Write + Send>(
+        &mut self, src: &mut R, dst: &mut W) -> Result<()>;
 }
 
 /// Trait for generating multipart separators.
@@ -165,7 +165,8 @@ enum PartHandlingStrategy {
     Multipart(Vec<u8>),
 }
 
-impl<'a, R : BufRead + 'a, W : Write + 'a, ENC : Encrypt, SGEN : SeparatorGen>
+impl<'a, R : BufRead + Send + 'a, W : Write + Send + 'a,
+     ENC : Encrypt, SGEN : SeparatorGen>
 Pipe<'a, R, W, ENC, SGEN> {
     /// Returns the line ending to use for new text. This is derived from the
     /// current line if it has a line-ending, and is CRLF otherwise.
@@ -494,7 +495,7 @@ Pipe<'a, R, W, ENC, SGEN> {
 }
 
 /// Processes all lines in `src`, writing to `dst`.
-pub fn process_file<R : BufRead, W : Write,
+pub fn process_file<R : BufRead + Send, W : Write + Send,
                     ENC : Encrypt, SGEN : SeparatorGen>
     (src: &mut mime::LineReader<R>, dst: &mut mime::LineWriter<W>,
      enc: ENC, sgen: SGEN) -> Result<()>
@@ -527,8 +528,8 @@ mod test {
 
     struct DummyEncrypt;
     impl Encrypt for DummyEncrypt {
-        fn encrypt<R : Read + ?Sized, W : Write + ?Sized>(
-            &self, src: &mut R, dst: &mut W) -> Result<()>
+        fn encrypt<R : Read + Send, W : Write + Send>(
+            &mut self, src: &mut R, dst: &mut W) -> Result<()>
         {
             try!(dst.write_all("<<<".as_bytes()));
             try!(io::copy(src, dst));
