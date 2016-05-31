@@ -98,6 +98,7 @@ struct Pipe<'a, R : BufRead + 'a, W : Write + 'a,
     enc: ENC,
     sgen: SGEN,
     last_ending: mime::LineEnding,
+    file_counter: u32,
 }
 
 /// Information about the header block of a single body part.
@@ -407,15 +408,18 @@ Pipe<'a, R, W, ENC, SGEN> {
         try!(self.dst.dst.write_all(&boundary));
         try!(self.puts(""));
         try!(self.puts("Content-Type: application/octet-stream;"));
-        try!(self.dst.dst.write_all("\tname=\"".as_bytes()));
-        try!(self.dst.dst.write_all(&boundary));
-        try!(self.puts(".asc\""));
+        // Using the boundary for the filename would seem logical, but
+        // Enigmail doesn't like the long names, so instead generate filenames
+        // from an incrementing counter, since they only need to be unique
+        // within the message.
+        try!(writeln!(self.dst.dst, "\tname=\"PGPipe-{}.asc\"",
+                      self.file_counter));
         try!(self.puts("Content-Description: OpenPGP encrypted message"));
         try!(self.puts("Content-Disposition: inline;"));
-        try!(self.dst.dst.write_all("\tfilename=\"".as_bytes()));
-        try!(self.dst.dst.write_all(&boundary));
-        try!(self.puts(".asc\""));
+        try!(writeln!(self.dst.dst, "\tfilename=\"PGPipe-{}.asc\"",
+                      self.file_counter));
         try!(self.puts(""));
+        self.file_counter += 1;
 
         let unconsumed_ending = try!(self.encrypt_section(headers));
 
@@ -514,6 +518,7 @@ pub fn process_file<R : BufRead + Send, W : Write + Send,
 {
     Pipe { src: src, dst: dst, enc: enc, sgen: sgen,
            last_ending: mime::LineEnding::CRLF,
+           file_counter: 1,
     }.process_file()
 }
 
@@ -567,6 +572,7 @@ mod test {
                 sgen: DetSeparatorGen::default(),
                 enc: DummyEncrypt,
                 last_ending: mime::LineEnding::CRLF,
+                file_counter: 1,
             };
 
             pipe.read_header_block().unwrap()
