@@ -99,6 +99,7 @@ struct Pipe<'a, R : BufRead + 'a, W : Write + 'a,
     sgen: SGEN,
     last_ending: mime::LineEnding,
     file_counter: u32,
+    recurse_into_multipart: bool,
 }
 
 /// Information about the header block of a single body part.
@@ -312,6 +313,8 @@ Pipe<'a, R, W, ENC, SGEN> {
                 } else if depth > MAX_DEPTH {
                     try!(self.note("Multipart too deep, skipping"));
                     PartHandlingStrategy::Plaintext
+                } else if !self.recurse_into_multipart {
+                    PartHandlingStrategy::Encrypt
                 } else if let Some(boundary) = content_type.boundary {
                     PartHandlingStrategy::Multipart(boundary)
                 } else {
@@ -511,14 +514,20 @@ Pipe<'a, R, W, ENC, SGEN> {
 }
 
 /// Processes all lines in `src`, writing to `dst`.
+///
+/// If recurse_into_multipart is true, each leaf of a multipart is encrypted
+/// separately. Otherwise, the whole multipart will be encrypted; this
+/// essentially means that each message is given exactly one encrypted part.
 pub fn process_file<R : BufRead + Send, W : Write + Send,
                     ENC : Encrypt, SGEN : SeparatorGen>
     (src: &mut mime::LineReader<R>, dst: &mut mime::LineWriter<W>,
-     enc: ENC, sgen: SGEN) -> Result<()>
+     enc: ENC, sgen: SGEN,
+     recurse_into_multipart: bool) -> Result<()>
 {
     Pipe { src: src, dst: dst, enc: enc, sgen: sgen,
            last_ending: mime::LineEnding::CRLF,
            file_counter: 1,
+           recurse_into_multipart: recurse_into_multipart,
     }.process_file()
 }
 
@@ -573,6 +582,7 @@ mod test {
                 enc: DummyEncrypt,
                 last_ending: mime::LineEnding::CRLF,
                 file_counter: 1,
+                recurse_into_multipart: true,
             };
 
             pipe.read_header_block().unwrap()
@@ -665,7 +675,7 @@ mod test {
             let mut reader = mime::LineReader::new(input.as_bytes()).unwrap();
             let mut writer = mime::LineWriter::new(&mut accum);
             process_file(&mut reader, &mut writer, DummyEncrypt,
-                         DetSeparatorGen::default()).unwrap();
+                         DetSeparatorGen::default(), true).unwrap();
         }
 
         if &output != from_utf8(&accum).unwrap() {

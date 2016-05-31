@@ -34,6 +34,9 @@ fn main() {
     let mut opts = Options::new();
     opts.parsing_style(getopts::ParsingStyle::StopAtFirstFree);
     opts.optflag("h", "help", "print this help menu");
+    opts.optflag("R", "recurse-into-multipart",
+                 "encrypt each item in a multipart separately \
+                  (breaks Enigmail)");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -55,6 +58,8 @@ fn main() {
         exit(64 /* EX_USAGE */);
     }
 
+    let recurse_into_multipart = matches.opt_present("R");
+
     let encrypt = match crypt::GpgEncrypt::new(matches.free) {
         Ok(e) => e,
         Err(err) => {
@@ -62,7 +67,7 @@ fn main() {
             exit(65 /* EX_DATAERR */);
         }
     };
-    match run(encrypt) {
+    match run(encrypt, recurse_into_multipart) {
         Ok(_) => (),
         Err(err) => {
             writeln!(stderr(), "Error: {}", err).unwrap();
@@ -76,9 +81,10 @@ fn print_usage<W : Write>(mut dst: W, program: &str, opts: &Options) {
     write!(dst, "{}", opts.usage(&brief)).unwrap();
 }
 
-fn run(encrypt: crypt::GpgEncrypt) -> io::Result<()> {
+fn run(encrypt: crypt::GpgEncrypt, recurse_into_multipart: bool)
+       -> io::Result<()> {
     pipe::process_file(
         &mut try!(mime::LineReader::new(BufReader::new(stdin()))),
         &mut mime::LineWriter::new(BufWriter::new(stdout())),
-        encrypt, pipe::UuidSeparatorGen)
+        encrypt, pipe::UuidSeparatorGen, recurse_into_multipart)
 }
