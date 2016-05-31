@@ -417,7 +417,7 @@ Pipe<'a, R, W, ENC, SGEN> {
         try!(self.puts(".asc\""));
         try!(self.puts(""));
 
-        try!(self.encrypt_section(headers));
+        let unconsumed_ending = try!(self.encrypt_section(headers));
 
         // End multipart
         try!(self.puts(""));
@@ -425,10 +425,20 @@ Pipe<'a, R, W, ENC, SGEN> {
         try!(self.dst.dst.write_all(&boundary));
         try!(self.puts("--"));
 
+        // If there was a trailing line ending unconsumed, write that out now.
+        if let Some(ending) = unconsumed_ending {
+            try!(self.dst.write(&mime::Line {
+                class: mime::LineClass::Generic,
+                ending: ending,
+                text: "".as_bytes()
+            }));
+        }
+
         Ok(())
     }
 
-    fn encrypt_section(&mut self, headers: HeaderBlock) -> Result<()> {
+    fn encrypt_section(&mut self, headers: HeaderBlock)
+                       -> Result<Option<mime::LineEnding>> {
         let mut header_bytes = Vec::new();
         try!(headers.dump(&mut mime::LineWriter::new(&mut header_bytes)));
 
@@ -436,9 +446,11 @@ Pipe<'a, R, W, ENC, SGEN> {
         // at the current position. We don't insert a blank line manually,
         // because the current position _is_ that blank line and thus gets
         // included "for free".
-        self.enc.encrypt(
-            &mut header_bytes[..].chain(mime::EntityStream::new(self.src)),
-            &mut self.dst.dst)
+        let mut entity_stream = mime::EntityStream::new(self.src);
+        try!(self.enc.encrypt(
+            &mut header_bytes[..].chain(&mut entity_stream),
+            &mut self.dst.dst));
+        Ok(entity_stream.unconsumed_line_ending())
     }
 
     fn process_multipart(&mut self, headers: HeaderBlock, depth: u32,
@@ -781,8 +793,9 @@ mod test {
                 CDCD,
                 "\tfilename=\"PGPipe-1.asc\"\n",
                 ENC_HW,
-                "--PGPipe-1--\n",
-                "--DELIM\n",
+                "--PGPipe-1--\n\
+                 \n\
+                 --DELIM\n",
                 CT_MP_ENC,
                 "\tboundary=\"PGPipe-2\"\n",
                 CT_PFX,
@@ -795,6 +808,7 @@ mod test {
                 "\tfilename=\"PGPipe-2.asc\"\n",
                 ENC_HW,
                 "--PGPipe-2--\n\
+                 \n\
                  --DELIM--\n\
                  This is the end of the multipart message.\n",
             ]);

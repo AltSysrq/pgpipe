@@ -6,3 +6,4 @@ authors = ["Jason Lingle <jason@lin.gl>"]
 [dependencies]
 gpgme = "0.4.0"
 uuid = { version = "0.2", features = ["v4"] }
+getopts = "0.2.14"
