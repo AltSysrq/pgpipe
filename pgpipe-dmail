@@ -1,0 +1,35 @@
+#! /bin/sh
+#-
+# Copyright (c) 2016, Jason Lingle
+#
+# Permission to  use, copy,  modify, and/or distribute  this software  for any
+# purpose  with or  without fee  is hereby  granted, provided  that the  above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE  IS PROVIDED "AS  IS" AND  THE AUTHOR DISCLAIMS  ALL WARRANTIES
+# WITH  REGARD   TO  THIS  SOFTWARE   INCLUDING  ALL  IMPLIED   WARRANTIES  OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT  SHALL THE AUTHOR BE LIABLE FOR ANY
+# SPECIAL,  DIRECT,   INDIRECT,  OR  CONSEQUENTIAL  DAMAGES   OR  ANY  DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+# OF  CONTRACT, NEGLIGENCE  OR OTHER  TORTIOUS ACTION,  ARISING OUT  OF OR  IN
+# CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# This shows how you can use PGPipe to encrypt all incoming mail via dmail (eg,
+# for use with UW-IMAP). For this to take effect, place
+# ```
+# "|/path/to/pgpipe-dmail"
+# ```
+# in `~/.forward`. You probably want to test this on a non-live account first.
+
+# One of the libraries needs to be able to find gpg on the path, or else
+# initialising gpgme fails with the mysterious
+# "Unknown protocol (gpg error 121)" message.
+PATH=/usr/local/bin:$PATH
+export PATH
+
+# Encrypt the message from stdin and deliver to INBOX.
+# Obviously, you need to put your own PGP key's fingerprint here. The
+# corresponding public key needs to be in your account's GPG database. (At
+# least if using OpenSMTPD; apparently some other MTAs run will run this under
+# their own account.)
+/usr/local/bin/pgpipe 8DDED51D | /usr/local/bin/dmail
