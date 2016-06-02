@@ -15,9 +15,7 @@
 
 //! Implements actual encryption through GPG.
 
-use std::convert::Into;
 use std::io::{self,Read,Write};
-use std::iter::IntoIterator;
 
 use gpgme;
 
@@ -32,9 +30,9 @@ pub struct GpgEncrypt {
 
 impl GpgEncrypt {
     /// Creates a new `GpgEncrypt`.
-    pub fn new<I>(patterns: I) -> gpgme::Result<GpgEncrypt>
-    where I : IntoIterator, I::Item : Into<String> {
+    pub fn new(patterns: Vec<String>) -> gpgme::Result<GpgEncrypt> {
         let mut ctx = try!(gpgme::create_context());
+        let patterns_len = patterns.len();
         let keys = {
             let mut it = try!(ctx.find_keys(patterns));
             let mut v = vec![];
@@ -43,6 +41,13 @@ impl GpgEncrypt {
             }
             v
         };
+
+        // In the current published version of the gpgme bindings, we have no
+        // way to get an error if any of the keys are invalid; instead, we just
+        // get fewer of them.
+        if keys.len() != patterns_len {
+            return Err(gpgme::Error::new(gpgme::error::GPG_ERR_NOT_FOUND));
+        }
 
         ctx.set_armor(true);
 
