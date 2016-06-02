@@ -45,13 +45,17 @@ impl GpgEncrypt {
         // In the current published version of the gpgme bindings, we have no
         // way to get an error if any of the keys are invalid; instead, we just
         // get fewer of them.
-        if keys.len() != patterns_len {
+        if keys.len() < patterns_len {
             return Err(gpgme::Error::new(gpgme::error::GPG_ERR_NOT_FOUND));
         }
 
         ctx.set_armor(true);
 
-        Ok(GpgEncrypt { ctx: ctx, keys: keys })
+        let mut this = GpgEncrypt { ctx: ctx, keys: keys };
+        // Test that encryption actually works and bail early if not.
+        try!(this.encrypt_impl(&mut "foo".as_bytes(), &mut Vec::new()));
+
+        Ok(this)
     }
 
     fn encrypt_impl<R : Read + Send, W : Write + Send>
