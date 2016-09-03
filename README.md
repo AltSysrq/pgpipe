@@ -127,4 +127,4 @@ message so that it does not get damaged.
 License
 -------
 
-[ISC](COPYING)
+[GPLv3 or later](COPYING)
